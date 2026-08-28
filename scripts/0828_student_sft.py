@@ -16,8 +16,9 @@ import shutil
 import sys
 import time
 from collections import Counter
-from transformers import TrainerCallback
 from pathlib import Path
+from transformers import TrainerCallback
+from runtime_config import STUDENT
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
@@ -68,15 +69,15 @@ def emit_metric(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", default="/data/magnus/models/Qwen3.5-9B-20260828")
-    p.add_argument("--data", default="/data/magnus/closedloop-0828/p2/sft_trajectories.jsonl")
-    p.add_argument("--out", default="/data/magnus/models/Qwen3.5-9B-sft-20260828")
-    p.add_argument("--lr", type=float, default=1.5e-4)
-    p.add_argument("--r", type=int, default=16)
-    p.add_argument("--max-steps", type=int, default=150)
-    p.add_argument("--max-seq-len", type=int, default=2048)
-    p.add_argument("--batch-size", type=int, default=2)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--model", default=os.environ.get("P3_MODEL", "/data/magnus/models/Qwen3.5-9B-20260828"))
+    p.add_argument("--data", default=os.environ.get("P3_DATA", "/data/magnus/closedloop-0828/p2/sft_trajectories.jsonl"))
+    p.add_argument("--out", default=os.environ.get("P3_OUT", "/data/magnus/models/Qwen3.5-9B-sft-20260828"))
+    p.add_argument("--lr", type=float, default=float(os.environ.get("P3_LR", "1.5e-4")))
+    p.add_argument("--r", type=int, default=int(os.environ.get("P3_LORA_R", "16")))
+    p.add_argument("--max-steps", type=int, default=int(os.environ.get("P3_MAX_STEPS", "150")))
+    p.add_argument("--max-seq-len", type=int, default=int(os.environ.get("P3_MAX_SEQ_LEN", str(STUDENT["sft_max_seq_len"]))))
+    p.add_argument("--batch-size", type=int, default=int(os.environ.get("P3_BATCH_SIZE", "8")))
+    p.add_argument("--grad-accum", type=int, default=int(os.environ.get("P3_GRAD_ACCUM", "1")))
     return p.parse_args()
 
 
@@ -125,7 +126,15 @@ def format_hit(text: str) -> bool:
     return all(tag in text for tag in ("<run>", "</run>", "<final>", "</final>"))
 
 
-def benchmark_checkpoint(model, tok, rows: list[dict], step: int, system_prompt: str, max_new_tokens: int = 256) -> dict:
+def benchmark_checkpoint(
+    model,
+    tok,
+    rows: list[dict],
+    step: int,
+    system_prompt: str,
+    max_new_tokens: int = 256,
+    batch_size: int = 4,
+) -> dict:
     """Run a bounded Transformers-only format benchmark on a P1 dev slice."""
     if not rows:
         return {"step": step, "available": False, "reason": "p1 dev slice unavailable"}
@@ -136,22 +145,45 @@ def benchmark_checkpoint(model, tok, rows: list[dict], step: int, system_prompt:
     hits = 0
     outputs = []
     with torch.no_grad():
-        for row in rows:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": row["prompt"]},
-            ]
-            # The model's tokenizer template is authoritative; P1 context is
-            # not a substitute for the approved 06 system prompt.
-            if "messages" in row:
-                messages = row["messages"][:2]
-            text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = tok(text, return_tensors="pt").to(model.device)
-            generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-            answer = tok.decode(generated[0][inputs["input_ids"].shape[1]:], skip_special_tokens=False)
-            ok = format_hit(answer)
-            hits += int(ok)
-            outputs.append({"problem_id": row.get("id"), "format_hit": ok, "output": answer[:800]})
+        for start in range(0, len(rows), batch_size):
+            batch_rows = rows[start:start + batch_size]
+            texts = []
+            for row in batch_rows:
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": row["prompt"]},
+                ]
+                # The model's tokenizer template is authoritative; P1 context is
+                # not a substitute for the approved 06 system prompt.
+                if "messages" in row:
+                    messages = row["messages"][:2]
+                texts.append(tok.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    chat_template_kwargs={"enable_thinking": STUDENT["enable_thinking"]},
+                ))
+            inputs = tok(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=STUDENT["max_model_len"],
+            ).to(model.device)
+            prompt_lengths = inputs["attention_mask"].sum(dim=1).tolist()
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tok.pad_token_id,
+            )
+            for row, sequence, prompt_len in zip(batch_rows, generated, prompt_lengths):
+                # With right padding, slice by the padded batch width; decode
+                # only newly generated tokens for each row.
+                answer = tok.decode(sequence[inputs["input_ids"].shape[1]:], skip_special_tokens=False)
+                ok = format_hit(answer)
+                hits += int(ok)
+                outputs.append({"problem_id": row.get("id"), "format_hit": ok, "output": answer[:800]})
     if was_training:
         model.train()
     rate = hits / len(rows)
@@ -219,6 +251,8 @@ def main() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; do not run P3 on CPU")
     if torch.version.cuda != "12.4":
@@ -262,6 +296,11 @@ def main() -> None:
 
     ds = load_dataset("json", data_files=str(data_snapshot), split="train")
     print(f"dataset rows: {len(ds)}")
+
+    def add_runtime_options(example):
+        return {"chat_template_kwargs": {"enable_thinking": STUDENT["enable_thinking"]}}
+
+    ds = ds.map(add_runtime_options)
     cfg = SFTConfig(
         output_dir=str(out / "trainer"),
         per_device_train_batch_size=args.batch_size,

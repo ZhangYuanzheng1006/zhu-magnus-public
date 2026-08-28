@@ -10,6 +10,7 @@
   python 0828_teacher_smoke.py --model /data/magnus/models/Qwen3.8-27B-20260828
 """
 import argparse, json, time, os, re
+from runtime_config import TEACHER, teacher_max_tokens
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -17,7 +18,7 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="/data/magnus/models/Qwen3.8-27B-20260828")
-    p.add_argument("--max-model-len", type=int, default=32768)
+    p.add_argument("--max-model-len", type=int, default=TEACHER["max_model_len"])
     p.add_argument("--gpu-mem-util", type=float, default=0.92)
     p.add_argument("--out", default="/data/magnus/smoke-0828/teacher")
     return p.parse_args()
@@ -52,8 +53,7 @@ SEED_PROBLEMS = [
     },
 ]
 
-# 官方推荐 thinking 采样参数
-SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "repetition_penalty": 1.0}
+SAMPLING = {**TEACHER["sampling"], "repetition_penalty": 1.0}
 
 
 def main():
@@ -99,7 +99,7 @@ def main():
                 chat_template_kwargs={"enable_thinking": True, "reasoning_effort": effort},
             )
             sp = SamplingParams(
-                max_tokens=4096,
+                max_tokens=teacher_max_tokens(effort),
                 **SAMPLING,
             )
             t1 = time.time()
