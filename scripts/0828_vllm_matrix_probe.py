@@ -34,7 +34,7 @@ try:
     result["vllm"] = vllm.__version__
     result["import"] = "pass"
 except Exception as exc:
-    result.update(import="fail", failure_stage="import", error=repr(exc))
+    result.update({"import": "fail", "failure_stage": "import", "error": repr(exc)})
     print(json.dumps(result)); raise SystemExit(0)
 try:
     import torch
