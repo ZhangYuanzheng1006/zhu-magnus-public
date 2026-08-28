@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-seq-len", type=int, default=int(os.environ.get("P3_MAX_SEQ_LEN", str(STUDENT["sft_max_seq_len"]))))
     p.add_argument("--batch-size", type=int, default=int(os.environ.get("P3_BATCH_SIZE", "8")))
     p.add_argument("--grad-accum", type=int, default=int(os.environ.get("P3_GRAD_ACCUM", "1")))
+    p.add_argument("--require-kernels", action="store_true", default=os.environ.get("P3_REQUIRE_KERNELS", "0") == "1")
+    p.add_argument("--scheduler", default=os.environ.get("P3_SCHEDULER", "constant"))
+    p.add_argument("--warmup-ratio", type=float, default=float(os.environ.get("P3_WARMUP_RATIO", "0")))
+    p.add_argument("--weight-decay", type=float, default=float(os.environ.get("P3_WEIGHT_DECAY", "0")))
+    p.add_argument("--max-grad-norm", type=float, default=float(os.environ.get("P3_MAX_GRAD_NORM", "1.0")))
+    p.add_argument("--gradient-checkpointing", action="store_true", default=os.environ.get("P3_GRADIENT_CHECKPOINTING", "0") == "1")
     return p.parse_args()
 
 
@@ -250,6 +256,7 @@ def main() -> None:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
+    from startup_gate import assert_startup_gate, run_startup_gate, write_gate
 
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -257,6 +264,10 @@ def main() -> None:
         raise RuntimeError("CUDA is unavailable; do not run P3 on CPU")
     if torch.version.cuda != "12.4":
         raise RuntimeError(f"expected CUDA 12.4 runtime, got {torch.version.cuda}")
+    pre_gate = run_startup_gate(attn_implementation="flash_attention_2")
+    write_gate(pre_gate, out / "startup_gate-pre-model.json")
+    if args.require_kernels:
+        assert_startup_gate(pre_gate)
 
     data_snapshot = out / "p3_input.jsonl"
     count, data_hash = snapshot_jsonl(args.data, data_snapshot)
@@ -269,8 +280,16 @@ def main() -> None:
         args.model,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
+        attn_implementation="flash_attention_2",
         trust_remote_code=False,
     )
+    for name, param in model.named_parameters():
+        if any(part in name.lower() for part in ("vision", "visual", "image_processor", "merger")):
+            param.requires_grad = False
+    post_gate = run_startup_gate(model=model, require_model=True, attn_implementation="flash_attention_2")
+    write_gate(post_gate, out / "startup_gate-post-model.json")
+    if args.require_kernels:
+        assert_startup_gate(post_gate)
     total_params = sum(p.numel() for p in model.parameters())
     lora = LoraConfig(
         r=args.r,
@@ -308,7 +327,12 @@ def main() -> None:
         gradient_accumulation_steps=args.grad_accum,
         max_steps=args.max_steps,
         learning_rate=args.lr,
+        lr_scheduler_type=args.scheduler,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         bf16=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         logging_steps=10,
         save_steps=75,
         save_only_model=False,
@@ -373,6 +397,15 @@ def main() -> None:
         "data_sha256": data_hash,
         "system_prompt_sha256": hashlib.sha256(ds[0]["messages"][0]["content"].encode("utf-8")).hexdigest(),
         "parameter_account": parameter_account,
+        "startup_gate_pre_model": pre_gate,
+        "startup_gate_post_model": post_gate,
+        "training_config": {
+            "lr_scheduler_type": args.scheduler,
+            "warmup_ratio": args.warmup_ratio,
+            "weight_decay": args.weight_decay,
+            "max_grad_norm": args.max_grad_norm,
+            "gradient_checkpointing": args.gradient_checkpointing,
+        },
         "dataset_rows": count,
         "training_seconds": round(train_seconds, 2),
         "max_steps_completed": int(trainer.state.global_step),

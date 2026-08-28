@@ -18,7 +18,7 @@ STUDENT = {
     "episode_max_tokens": 4096,
     "episode_max_runs": 8,
     "sft_max_seq_len": 4096,
-    "grpo_sampling": {"temperature": 1.0, "top_p": 1.0},
+    "grpo_sampling": {"temperature": 0.8, "top_p": 0.95},
     "eval_sampling": {"temperature": 0.0},
 }
 
