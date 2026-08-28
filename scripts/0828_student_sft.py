@@ -264,6 +264,7 @@ def main() -> None:
     emit_metric("data.rows", count, kind="counter", step=0, step_domain="data", unit="rows", labels={"phase": "p3"})
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    tok.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.bfloat16,
@@ -341,9 +342,10 @@ def main() -> None:
     result = trainer.train()
     train_seconds = time.time() - train_start
 
-    # Trainer save_steps supplies the actual step-75 checkpoint. The model in
-    # memory is the step-150 state, so benchmark it as the final checkpoint.
-    checkpoints.append(benchmark_checkpoint(model, tok, dev_rows, args.max_steps, system_prompt))
+    # The on_save callback records step 150 when save_steps reaches the final
+    # step; append a final benchmark only if that callback did not run.
+    if not any(item.get("step") == args.max_steps for item in checkpoints):
+        checkpoints.append(benchmark_checkpoint(model, tok, dev_rows, args.max_steps, system_prompt))
     trainer.save_model(str(out / "adapter"))
     tok.save_pretrained(str(out / "adapter"))
 
