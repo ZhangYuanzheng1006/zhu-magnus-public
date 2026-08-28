@@ -92,24 +92,28 @@ def main() -> int:
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     safe = args.candidate.replace("<", "lt").replace(">", "gt").replace("=", "").replace(",", "_")
     venv = out / ("venv-" + safe.replace(".", "_"))
-    record = {"schema": "r2-0-vllm-matrix/v2", "candidate_spec": args.candidate,
+    record = {"schema": "r2-0-vllm-matrix/v3", "candidate_spec": args.candidate,
               "model": args.model, "max_model_len": args.max_model_len,
               "requested_max_tokens": args.max_tokens, "venv": str(venv),
-              "isolation": "candidate-specific venv", "install": "not_run"}
+              "isolation": "candidate-specific venv with system site packages",
+              "dependency_policy": "vllm --no-deps; preserve base-image torch", "install": "not_run"}
     if not venv.exists():
-        stdout, status, rc = run([sys.executable, "-m", "venv", str(venv)], timeout=120)
+        stdout, status, rc = run([sys.executable, "-m", "venv", "--system-site-packages", str(venv)], timeout=120)
         if status != "completed" or rc != 0:
             record.update(install="fail", failure_stage="venv", pip_log_tail=stdout)
             (out / (safe + ".json")).write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
             print(json.dumps(record, ensure_ascii=False)); return 1
     py = venv / ("Scripts" if os.name == "nt" else "bin") / "python"
-    stdout, status, rc = run([str(py), "-m", "pip", "install", "--no-cache-dir", args.candidate], timeout=args.install_timeout)
+    stdout, status, rc = run([str(py), "-m", "pip", "install", "--no-cache-dir", "--no-deps", args.candidate], timeout=args.install_timeout)
     record["pip_log_tail"] = stdout
     if status != "completed" or rc != 0:
         record.update(install="timeout" if status == "timeout" else "fail", failure_stage="install")
     else:
         record["install"] = "pass"
         record.update(probe(str(py), args.model, args.max_model_len, args.max_tokens))
+        if record.get("torch_cuda") != "12.4" or not str(record.get("torch", "")).startswith("2.5.1"):
+            record["environment_warning"] = "base image torch/CUDA is not the required 2.5.1/cu124"
+            record["failure_stage"] = "environment"
     record["elapsed_seconds"] = round(time.time() - started, 3)
     (out / (safe + ".json")).write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(record, ensure_ascii=False))
