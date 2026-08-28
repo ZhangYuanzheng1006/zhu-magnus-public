@@ -8,6 +8,12 @@
 """
 import argparse, json, random, hashlib, os, sympy as sym
 
+
+def stable_seed(name: str, index: int) -> int:
+    """Derive a reproducible per-category seed across Python processes."""
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return 1000 + (int(digest, 16) % 1000) * 100 + index
+
 # 06 §5 系统提示词全文(v1.0-rc1,中文版)——逐字复制
 SYSTEM_PROMPT = """你是一个数学推导助手,可以使用一个 Python 代码沙箱来推导和验证答案。请先阅读以下说明。
 
@@ -188,7 +194,7 @@ def main():
     rows = []
     for name, gen in GENERATORS.items():
         for i in range(per):
-            seed = 1000 + hash(name) % 1000 * 100 + i
+            seed = stable_seed(name, i)
             prompt, steps, final = gen(seed)
             msgs = build_messages(prompt, steps, final)
             rows.append({
