@@ -92,13 +92,18 @@ def main():
 
         for effort in ["medium", "low"]:
             print(f"  effort={effort}")
+            # Qwen3.8 的 reasoning_effort 是 chat-template 参数,不是 SamplingParams 参数。
+            # 模板会把 effort 说明写入 system prompt,从而控制思考深度。
+            effort_text = tok.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False,
+                chat_template_kwargs={"enable_thinking": True, "reasoning_effort": effort},
+            )
             sp = SamplingParams(
                 max_tokens=4096,
-                reasoning_effort=effort,
                 **SAMPLING,
             )
             t1 = time.time()
-            out = llm.generate([text], sp)
+            out = llm.generate([effort_text], sp)
             gen_s = time.time() - t1
             gen = out[0].outputs[0]
             full = gen.text
