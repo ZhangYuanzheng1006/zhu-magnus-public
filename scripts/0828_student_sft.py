@@ -99,17 +99,18 @@ def main():
         bf16=True,
         logging_steps=10,
         save_steps=50,
-        max_seq_length=args.max_seq_len,
+        max_length=args.max_seq_len,
         packing=False,
         dataset_text_field="text",
+        assistant_only_loss=True,
         report_to=[],
     )
     trainer = SFTTrainer(
         model=model,
         args=sft_cfg,
         train_dataset=ds,
-        tokenizer=tok,
-        data_collator=None,  # SFTTrainer 默认 collator 做 completion-only mask
+        processing_class=tok,
+        data_collator=None,  # SFTTrainer 默认 collator;assistant_only_loss 只对 assistant 段计 loss
     )
     t0 = time.time()
     trainer.train()
