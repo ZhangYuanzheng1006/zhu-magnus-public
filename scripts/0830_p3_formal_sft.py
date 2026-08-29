@@ -440,15 +440,20 @@ def main() -> int:
         flush()
 
     class GateCallback(TrainerCallback):
+        last_emitted_log_step = None
+
         def on_step_end(self, args, state, control, **kw2):
             hist = [h for h in state.log_history if "loss" in h]
-            if hist:
+            # Emit ONLY when trainer logging produces a new point (logging_steps);
+            # re-emitting the stale value every step renders as stair-steps.
+            if hist and hist[-1].get("step") != self.last_emitted_log_step:
                 h = hist[-1]
+                self.last_emitted_log_step = h.get("step")
                 for key, name in (("loss", "p3f.train.loss"), ("grad_norm", "p3f.train.grad_norm"),
                                   ("learning_rate", "p3f.train.lr"), ("entropy", "p3f.train.entropy"),
                                   ("mean_token_accuracy", "p3f.train.token_acc")):
                     if h.get(key) is not None:
-                        emit(name, h[key], step=state.global_step)
+                        emit(name, h[key], step=h["step"])
             if state.global_step % EVAL_EVERY == 0:
                 evaluate_and_decide(trainer_ref[0], state.global_step)
 
