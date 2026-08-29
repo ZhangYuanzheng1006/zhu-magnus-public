@@ -28,11 +28,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "r3-3-sft-eval-v2"
+VERSION = "r3-3-sft-eval-v4"
 BASE_MODEL = os.environ.get("R3_MODEL", "/data/magnus/models/Qwen3.5-9B-20260828")
 DATA = os.environ.get("R3_DATA", "/data/magnus/closedloop-0828/p2/sft_trajectories.jsonl")
 QUESTIONS = "/data/magnus/closedloop-0828/p1/problems.jsonl"
-OUT = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-3-sft-eval-v2"))
+OUT = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-3-sft-eval-v4"))
 EXPECT_SYSTEM_SHA = "8ed1122a47ae089b1f577d61ad906cf4f7aa5f39627bfef7b6bf2afe79be3217"
 MAX_STEPS = 150
 LR = 2e-5
@@ -233,7 +233,7 @@ def main() -> int:
         if any(part in name.lower() for part in ("vision", "visual", "image_processor", "merger")):
             param.requires_grad = False
     lora = LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, target_modules="all-linear",
-                      lora_dropout=0.05, trust_remote_code=False)
+                      lora_dropout=0.05)
     model = get_peft_model(model, lora)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -249,21 +249,20 @@ def main() -> int:
     flush_receipt()
     marker("dataset", "done", rows=len(ds))
 
-    cfg = SFTConfig(
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(SFTConfig)}
+    kw: dict[str, Any] = dict(
         output_dir=str(OUT / "trainer"),
         per_device_train_batch_size=MICRO_BATCH,
         gradient_accumulation_steps=GRAD_ACCUM,
         max_steps=MAX_STEPS,
         learning_rate=LR,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.05,
         weight_decay=0.0,
         max_grad_norm=1.0,
         bf16=True,
         gradient_checkpointing=True,
         logging_steps=10,
         save_steps=75,
-        save_only_model=False,
         max_length=MAX_LEN,
         packing=False,
         dataset_text_field="text",
@@ -272,6 +271,25 @@ def main() -> int:
         seed=20260828,
         data_seed=20260828,
     )
+    # transformers/TRL renamed or dropped kwargs across majors; build defensively
+    # and record what was actually accepted (warmup 5 percent of 150 steps = 8).
+    if "warmup_ratio" in fields:
+        kw["warmup_ratio"] = 0.05
+    elif "warmup_steps" in fields:
+        kw["warmup_steps"] = max(1, int(0.05 * MAX_STEPS))
+    if "lr_scheduler_type" in fields:
+        kw["lr_scheduler_type"] = "cosine"
+    elif "lr_scheduler" in fields:
+        kw["lr_scheduler"] = "cosine"
+    if "save_only_model" in fields:
+        kw["save_only_model"] = False
+    dropped = sorted({"warmup_ratio", "lr_scheduler_type", "lr_scheduler", "save_only_model"}
+                     - fields)
+    RECEIPT["sft_config_fields_used"] = sorted(kw.keys())
+    RECEIPT["sft_config_fields_dropped"] = dropped
+    flush_receipt()
+    marker("sft_config", "done", dropped=",".join(dropped) if dropped else "none")
+    cfg = SFTConfig(**kw)
     t1 = time.time()
     marker("train", "start", steps=MAX_STEPS)
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, processing_class=tok)
