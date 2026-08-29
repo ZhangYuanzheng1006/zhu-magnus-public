@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ROOTS = ("/data", "/tmp")
+DEFAULT_ROOTS = ("/data/magnus", "/tmp")
 CHUNK = 1024 * 1024
 RANDOM_BLOCK = 4096
 
@@ -128,7 +128,7 @@ def main() -> int:
     parser.add_argument("--max-mib", type=int, default=256, help="payload size per root (maximum 256 MiB by default)")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--samples", type=int, default=3)
-    parser.add_argument("--out", default="/data/magnus/closedloop-0828/disk-io-probe")
+    parser.add_argument("--out", default="/data/magnus/closedloop-0828/disk-io-probe-v2")
     args = parser.parse_args()
     if not 1 <= args.max_mib <= 256:
         parser.error("--max-mib must be between 1 and 256")
