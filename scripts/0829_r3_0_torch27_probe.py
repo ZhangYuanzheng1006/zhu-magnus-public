@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "r3-0-torch27-probe-v1"
+VERSION = "r3-0-torch27-probe-v2"
 VENV_DIR = Path("/tmp/r3-0/venv")
 WORK_DIR = Path("/tmp/r3-0")
 OUT_DIR = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-0-torch27-v1"))
@@ -42,9 +42,9 @@ VLLM_DEPS = [
     "annotated-types==0.7.0",
 ]
 TORCH_ATTEMPTS = [
-    ("pytorch_official_cu126", ["--index-url", "https://download.pytorch.org/whl/cu126"], 900),
-    ("pypi_default", [], 900),
-    ("aliyun_pytorch_wheels", ["-f", "https://mirrors.aliyun.com/pytorch-wheels/cu126/"], 900),
+    ("aliyun_pytorch_wheels", ["-f", "https://mirrors.aliyun.com/pytorch-wheels/cu126/"], 1200),
+    ("pypi_default", [], 1200),
+    ("pytorch_official_cu126", ["--index-url", "https://download.pytorch.org/whl/cu126"], 1200),
 ]
 
 MATRIX: dict[str, Any] = {"version": VERSION, "torch": TORCH_VERSION, "vllm": VLLM_VERSION}
@@ -73,6 +73,54 @@ def run(cmd: list[str], timeout: int, *, env: dict[str, str] | None = None) -> t
         return 125, "", f"{type(exc).__name__}: {exc}"
     finally:
         print(f"--- cmd took {time.time() - t0:.1f}s: {' '.join(cmd[:6])} ...", flush=True)
+
+
+def stream_cmd(cmd: list[str], timeout: int, *, env: dict[str, str] | None = None,
+               heartbeat_s: int = 45) -> tuple[int, str, str]:
+    """Long installs: stream pip lines live and print a heartbeat so the job
+    log never goes silent (v1 was slurm-CANCELLED mid silent download)."""
+    import threading
+    t0 = time.time()
+    stop = threading.Event()
+    marker("heartbeat", "start", every_s=heartbeat_s)
+
+    def beat() -> None:
+        n = 0
+        while not stop.wait(heartbeat_s):
+            n += 1
+            print(f"[heartbeat] alive_s={int(time.time() - t0)} beat={n}", flush=True)
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+    rc = 0
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        import threading as th2
+
+        def pump(src, sink: list[str], tag: str) -> None:
+            for line in src:
+                sink.append(line)
+                if tag == "out" and len(sink) % 5 == 0:
+                    print(f"pip| {line.strip()[:160]}", flush=True)
+
+        t_out = th2.Thread(target=pump, args=(proc.stdout, out_lines, "out"), daemon=True)
+        t_err = th2.Thread(target=pump, args=(proc.stderr, err_lines, "err"), daemon=True)
+        t_out.start(); t_err.start()
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = 124
+        t_out.join(5); t_err.join(5)
+    except Exception as exc:  # noqa: BLE001
+        return 125, "", f"{type(exc).__name__}: {exc}"
+    finally:
+        stop.set(); thread.join(2)
+        print(f"--- streamed cmd took {time.time() - t0:.1f}s rc={rc}: {' '.join(cmd[:6])} ...", flush=True)
+    return rc, "".join(out_lines), "".join(err_lines)
 
 
 def tail(text: str, limit: int = 3000) -> str:
@@ -113,12 +161,14 @@ def torch_verify() -> tuple[bool, str]:
 
 
 def stage_torch_install() -> bool:
+    env = dict(os.environ)
+    env["PIP_CACHE_DIR"] = "/tmp/r3-0/pipcache"
     for name, extra, timeout in TORCH_ATTEMPTS:
         t0 = time.time()
         marker("torch_install", "attempt", mirror=name)
         cmd = [str(VENV_DIR / "bin" / "pip"), "install", f"torch=={TORCH_VERSION}",
-               "--timeout", "60", "--retries", "2", *extra]
-        rc, out, err = run(cmd, timeout)
+               "--timeout", "60", "--retries", "2", "--progress-bar", "off", *extra]
+        rc, out, err = stream_cmd(cmd, timeout, env=env)
         if rc != 0:
             record("torch_install", **{f"rc_{name}": rc, f"err_{name}": tail(err, 800),
                                        f"seconds_{name}": round(time.time() - t0, 1)})
@@ -262,24 +312,49 @@ def stage_vllm_load_generate(model_path: str) -> bool:
     return ok
 
 
+def start_gpu_keepalive() -> subprocess.Popen | None:
+    """v1 was slurm-CANCELLED ~21 min in with the GPU allocated but untouched
+    during silent pip downloads. Keep a tiny CUDA workload alive throughout."""
+    script = (
+        "import torch, time\n"
+        "while True:\n"
+        "    try:\n"
+        "        a = torch.randn(256, 256, device='cuda'); b = torch.randn(256, 256, device='cuda')\n"
+        "        c = (a @ b).sum().item(); open('/tmp/r3-0/keepalive.txt', 'w').write(str(time.time()))\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    time.sleep(30)\n"
+    )
+    p = subprocess.Popen(["python3", "-c", script], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    marker("keepalive", "start", pid=p.pid)
+    return p
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    stage_env()
-    ok_venv = stage_venv()
-    ok_torch = stage_torch_install() if ok_venv else False
-    if ok_torch:
-        stage_cuda_matmul()
-        stage_inductor_api()
-    ok_vllm = stage_vllm_install() if ok_torch else False
-    ok_import = stage_vllm_import() if ok_vllm else False
-    model = resolve_base_model()
-    MATRIX["base_model"] = model
-    ok_gen = False
-    if ok_import and model:
-        ok_gen = stage_vllm_load_generate(model)
-    elif not model:
-        record("vllm_load_generate", skipped="no base model path found")
+    keepalive = start_gpu_keepalive()
+    try:
+        stage_env()
+        ok_venv = stage_venv()
+        ok_torch = stage_torch_install() if ok_venv else False
+        if ok_torch:
+            stage_cuda_matmul()
+            stage_inductor_api()
+        ok_vllm = stage_vllm_install() if ok_torch else False
+        ok_import = stage_vllm_import() if ok_vllm else False
+        model = resolve_base_model()
+        MATRIX["base_model"] = model
+        ok_gen = False
+        if ok_import and model:
+            ok_gen = stage_vllm_load_generate(model)
+        elif not model:
+            record("vllm_load_generate", skipped="no base model path found")
+    finally:
+        if keepalive:
+            keepalive.terminate()
+            marker("keepalive", "stop", pid=keepalive.pid)
     verdict = {
         "torch27_cuda": ok_torch, "vllm_import": ok_import,
         "vllm_generate": ok_gen,
