@@ -68,6 +68,7 @@ def notify(msg: str) -> None:
 def klog(kill: str, detail: str) -> None:
     RECEIPT["kill_log"].append({"kill": kill, "detail": detail, "t": time.time()})
     flush()
+    emit("p3f.kill", 1, kind="counter", labels={"kill": kill})
     notify(f"KILL-SWITCH {kill}: {detail}")
 
 
@@ -76,6 +77,37 @@ def flush() -> None:
     tmp = OUT / "receipt.json.tmp"
     tmp.write_text(json.dumps(RECEIPT, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(OUT / "receipt.json")
+
+
+
+
+def emit(name: str, value: float, *, kind: str = "gauge", step: int | None = None,
+         step_domain: str | None = None, unit: str | None = None,
+         labels: dict[str, str] | None = None) -> bool:
+    """Magnus Metrics Protocol v1, fail-open (mirrors public/mathphys/metrics.py)."""
+    try:
+        value = float(value)
+        import math as _m
+        if not _m.isfinite(value) or kind not in {"gauge", "counter"}:
+            return False
+        directory = os.environ.get("MAGNUS_METRICS_DIR")
+        if not directory or not os.path.isdir(directory):
+            return False
+        point: dict[str, Any] = {"name": name, "kind": kind, "value": value,
+                                 "time_unix_ms": int(time.time() * 1000)}
+        if step is not None:
+            point["step"] = int(step)
+            point["step_domain"] = step_domain or "global"
+        if unit is not None:
+            point["unit"] = unit
+        if labels:
+            point["labels"] = {str(k): str(v) for k, v in labels.items()}
+        with (Path(directory) / "rank-0.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(point, ensure_ascii=False, separators=(",", ":")) + "\n")
+            f.flush()
+        return True
+    except Exception:
+        return False
 
 
 def sha256_file(path: str) -> str:
@@ -229,8 +261,11 @@ def main() -> int:
 
     OUT.mkdir(parents=True, exist_ok=True)
     RECEIPT["torch"] = torch.__version__
+    RECEIPT["metrics_dir_present"] = bool(os.environ.get("MAGNUS_METRICS_DIR"))
     flush()
-    marker("env", "done", torch=torch.__version__, micro=MICRO, accum=ACCUM)
+    marker("env", "done", torch=torch.__version__, micro=MICRO, accum=ACCUM,
+           metrics_dir=RECEIPT["metrics_dir_present"])
+    emit("p3f.env", 1, kind="counter", labels={"micro": str(MICRO), "accum": str(ACCUM)})
 
     # data
     train_rows = []
@@ -355,6 +390,11 @@ def main() -> int:
         ck = {"step": step, "dev": dual, "recent_loss": recent_loss,
               "probe_loss": probe, "probe_ratio": probe_ratio}
         RECEIPT.setdefault("checkpoints", []).append(ck)
+        emit("p3f.dev.format_rate", dual["format_rate"], step=step)
+        emit("p3f.dev.sym_rate", dual["sym_rate"], step=step)
+        if probe_ratio is not None:
+            emit("p3f.probe_ratio", probe_ratio, step=step)
+        emit("p3f.checkpoint", 1, kind="counter", step=step)
         # F3 dual selection
         qualifies = dual["format_rate"] >= FORMAT_TARGET and dual["sym_rate"] > 0
         if qualifies and (state["p4_entry"] is None):
@@ -401,7 +441,14 @@ def main() -> int:
 
     class GateCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kw2):
-            state.global_step  # noqa: B018
+            hist = [h for h in state.log_history if "loss" in h]
+            if hist:
+                h = hist[-1]
+                for key, name in (("loss", "p3f.train.loss"), ("grad_norm", "p3f.train.grad_norm"),
+                                  ("learning_rate", "p3f.train.lr"), ("entropy", "p3f.train.entropy"),
+                                  ("mean_token_accuracy", "p3f.train.token_acc")):
+                    if h.get(key) is not None:
+                        emit(name, h[key], step=state.global_step)
             if state.global_step % EVAL_EVERY == 0:
                 evaluate_and_decide(trainer_ref[0], state.global_step)
 
