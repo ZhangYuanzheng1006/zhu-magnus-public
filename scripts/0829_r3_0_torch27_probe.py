@@ -15,6 +15,7 @@ raised. Outer success never implies vLLM compatibility.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -24,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "r3-0-torch27-probe-v3"
+VERSION = "r3-0-torch27-probe-v4"
 VENV_DIR = Path("/dev/shm/r3-0/venv")
 WHEEL_DIR = Path("/tmp/r3-0/wheels")
 WORK_DIR = Path("/tmp/r3-0")
@@ -34,6 +35,17 @@ BASE_MODEL_CANDIDATES = [
 ]
 TORCH_VERSION = "2.7.1"
 VLLM_VERSION = "0.22.1"
+# v3 finding: the vllm 0.22.1 wheel currently served by the default PyPI
+# mirror is CUDA-13-linked (import vllm._C -> libcudart.so.13 missing), while
+# the R2-0-era wheel of the same version loaded its _C on cu124. v4 hunts for
+# a CUDA-12-linked wheel: current mirror 0.22.1/0.23.0, then the official
+# per-release wheel index. First candidate whose _C imports wins the e2e.
+VLLM_CANDIDATES = [
+    ("pypi_0.22.1", [], "vllm==0.22.1"),
+    ("pypi_0.23.0", [], "vllm==0.23.0"),
+    ("wheels_vllm_ai_0.22.1", ["--index-url", "https://wheels.vllm.ai/0.22.1/"], "vllm==0.22.1"),
+    ("wheels_vllm_ai_0.23.0", ["--index-url", "https://wheels.vllm.ai/0.23.0/"], "vllm==0.23.0"),
+]
 # Pure-python / pinned deps proven necessary by the R2-0 v2..v8 probe series.
 VLLM_DEPS = [
     "cloudpickle",
@@ -227,21 +239,68 @@ def stage_inductor_api() -> None:
     marker("inductor_api", "done", torch27=rc == 0, torch25=rc25 == 0)
 
 
-def stage_vllm_install() -> bool:
+def stage_vllm_deps() -> bool:
     t0 = time.time()
-    rc, out, err = run([str(VENV_DIR / "bin" / "pip"), "install", f"vllm=={VLLM_VERSION}",
-                        "--no-deps", "--timeout", "60"], 1200)
-    ok_main = rc == 0
-    record("vllm_install", ok_main=ok_main, rc=rc, err=tail(err, 800),
-           seconds=round(time.time() - t0, 1))
-    for dep in VLLM_DEPS:
-        rc_d, out_d, err_d = run([str(VENV_DIR / "bin" / "pip"), "install", dep, "--timeout", "60"], 300)
-        record("vllm_install", **{f"dep_{dep.split('==')[0].replace('-', '_')}": rc_d == 0})
-        if rc_d != 0:
-            marker("vllm_install", "dep_fail", dep=dep)
-    ok = ok_main
-    marker("vllm_install", "done" if ok else "fail")
-    return ok
+    env = dict(os.environ)
+    env["PIP_CACHE_DIR"] = "/tmp/r3-0/pipcache"
+    env["PIP_NO_COMPILE"] = "1"
+    rc, out, err = stream_cmd([str(VENV_DIR / "bin" / "pip"), "install", *VLLM_DEPS,
+                               "--timeout", "60", "--progress-bar", "off"], 600, env=env)
+    record("vllm_deps", rc=rc, seconds=round(time.time() - t0, 1), err=tail(err, 500))
+    marker("vllm_deps", "done" if rc == 0 else "fail")
+    return rc == 0
+
+
+def wheel_provenance(wheel_dir: Path) -> list[dict[str, Any]]:
+    info = []
+    for p in sorted(wheel_dir.glob("*.whl")):
+        h = hashlib.sha256(p.read_bytes()).hexdigest()
+        info.append({"file": p.name, "bytes": p.stat().st_size, "sha256": h})
+    return info
+
+
+def stage_vllm_hunt() -> tuple[bool, str | None]:
+    """Try each candidate wheel; first one whose compiled _C imports on this
+    driver/runtime goes straight to the 9B e2e. Everything is fingerprinted."""
+    env = dict(os.environ)
+    env["PIP_CACHE_DIR"] = "/tmp/r3-0/pipcache"
+    env["PIP_NO_COMPILE"] = "1"
+    c_probe = "import vllm._C; import vllm; print('vllm', vllm.__version__, '_C OK')"
+    for tag, extra, spec in VLLM_CANDIDATES:
+        wheel_dir = WORK_DIR / f"vllm-wheels-{tag}"
+        t0 = time.time()
+        marker("vllm_hunt", "download", tag=tag)
+        dl = [str(VENV_DIR / "bin" / "pip"), "download", spec, "--no-deps",
+              "-d", str(wheel_dir), "--timeout", "60", "--progress-bar", "off", *extra]
+        rc, out, err = stream_cmd(dl, 900, env=env)
+        prov = wheel_provenance(wheel_dir) if wheel_dir.exists() else []
+        record("vllm_hunt", **{f"{tag}_download_rc": rc, f"{tag}_wheels": prov,
+                               f"{tag}_download_s": round(time.time() - t0, 1),
+                               f"{tag}_download_err": tail(err, 500)})
+        if rc != 0 or not prov:
+            marker("vllm_hunt", "download_fail", tag=tag)
+            continue
+        wheel_file = str(wheel_dir / prov[0]["file"])
+        rc, out, err = stream_cmd([str(VENV_DIR / "bin" / "pip"), "install", "--no-deps",
+                                   wheel_file, "--progress-bar", "off"], 600, env=env)
+        record("vllm_hunt", **{f"{tag}_install_rc": rc})
+        if rc != 0:
+            marker("vllm_hunt", "install_fail", tag=tag)
+            continue
+        rc, out, err = run([str(VENV_DIR / "bin" / "python"), "-c", c_probe], 300, env=env)
+        record("vllm_hunt", **{f"{tag}_c_probe_rc": rc, f"{tag}_c_probe_out": tail(out, 200),
+                               f"{tag}_c_probe_err": tail(err, 1200)})
+        if rc != 0:
+            kind = "cuda13_linked" if "libcudart.so.13" in err else "c_probe_other"
+            marker("vllm_hunt", "c_probe_fail", tag=tag, kind=kind)
+            record("vllm_hunt", **{f"{tag}_fail_kind": kind})
+            # uninstall so the next candidate's files are authoritative
+            run([str(VENV_DIR / "bin" / "pip"), "uninstall", "-y", "vllm"], 120, env=env)
+            continue
+        marker("vllm_hunt", "c_probe_ok", tag=tag)
+        return True, tag
+    marker("vllm_hunt", "exhausted")
+    return False, None
 
 
 def resolve_base_model() -> str | None:
@@ -275,32 +334,6 @@ print("=== R3-0 GEN_TEXT begin ===", flush=True)
 print(text, flush=True)
 print("=== R3-0 GEN_TEXT end ===", flush=True)
 '''
-
-
-def stage_vllm_import() -> bool:
-    t0 = time.time()
-    repair_map = {"cloudpickle": "cloudpickle", "pydantic": "pydantic",
-                  "typing_inspection": "typing-inspection", "annotated_types": "annotated-types",
-                  "tiktoken": "tiktoken", "jsonschema": "jsonschema", "einops": "einops"}
-    rounds = 0
-    while rounds <= 2:
-        rc, out, err = run([str(VENV_DIR / "bin" / "python"), "-c",
-                            "import vllm; print(vllm.__version__)"], 600)
-        record("vllm_import", rc=rc, err=tail(err, 1500), out=tail(out, 300),
-               seconds=round(time.time() - t0, 1), rounds=rounds)
-        if rc == 0:
-            marker("vllm_import", "done", rounds=rounds)
-            return True
-        miss = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", err)
-        if miss and rounds < 2 and miss.group(1).split(".")[0] in repair_map:
-            pkg = repair_map[miss.group(1).split(".")[0]]
-            marker("vllm_import", "repair", pkg=pkg, rounds=rounds)
-            run([str(VENV_DIR / "bin" / "pip"), "install", pkg, "--timeout", "60"], 300)
-            rounds += 1
-            continue
-        marker("vllm_import", "fail", rounds=rounds)
-        return False
-    return False
 
 
 def stage_vllm_load_generate(model_path: str) -> bool:
@@ -371,12 +404,17 @@ def main() -> int:
         if ok_torch:
             stage_cuda_matmul()
             stage_inductor_api()
-        ok_vllm = stage_vllm_install() if ok_torch else False
-        ok_import = stage_vllm_import() if ok_vllm else False
+        ok_c = False
+        won_tag = None
+        if ok_torch:
+            ok_deps = stage_vllm_deps()
+            if ok_deps:
+                ok_c, won_tag = stage_vllm_hunt()
+        MATRIX["vllm_wheel_tag"] = won_tag
         model = resolve_base_model()
         MATRIX["base_model"] = model
         ok_gen = False
-        if ok_import and model:
+        if ok_c and model:
             ok_gen = stage_vllm_load_generate(model)
         elif not model:
             record("vllm_load_generate", skipped="no base model path found")
@@ -385,9 +423,9 @@ def main() -> int:
             keepalive.terminate()
             marker("keepalive", "stop", pid=keepalive.pid)
     verdict = {
-        "torch27_cuda": ok_torch, "vllm_import": ok_import,
+        "torch27_cuda": ok_torch, "vllm_import": ok_c,
         "vllm_generate": ok_gen,
-        "unified_env": bool(ok_torch and ok_vllm and ok_gen),
+        "unified_env": bool(ok_torch and ok_c and ok_gen),
     }
     MATRIX["verdict"] = verdict
     (OUT_DIR / "receipt.json").write_text(json.dumps(MATRIX, ensure_ascii=False, indent=2), encoding="utf-8")
