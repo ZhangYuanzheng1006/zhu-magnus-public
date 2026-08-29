@@ -96,7 +96,7 @@ def main() -> int:
               "model": args.model, "max_model_len": args.max_model_len,
               "requested_max_tokens": args.max_tokens, "venv": str(venv),
               "isolation": "candidate-specific venv with system site packages",
-              "dependency_policy": "vllm/cloudpickle/pydantic/pydantic-core --no-deps; preserve base-image torch",
+              "dependency_policy": "vllm/cloudpickle/pydantic/pydantic-core/typing-inspection --no-deps; preserve base-image torch",
               "pinned_python_deps": {"pydantic": "2.13.5", "pydantic-core": "2.46.5"},
               "protected_environment": "torch 2.5.1+cu124", "install": "not_run"}
     if not venv.exists():
@@ -107,7 +107,7 @@ def main() -> int:
             print(json.dumps(record, ensure_ascii=False)); return 1
     py = venv / ("Scripts" if os.name == "nt" else "bin") / "python"
     stdout, status, rc = run([str(py), "-m", "pip", "install", "--no-cache-dir", "--no-deps",
-                              args.candidate, "cloudpickle", "pydantic==2.13.5", "pydantic-core==2.46.5"], timeout=args.install_timeout)
+                              args.candidate, "cloudpickle", "pydantic==2.13.5", "pydantic-core==2.46.5", "typing-inspection==0.4.2"], timeout=args.install_timeout)
     record["pip_log_tail"] = stdout
     if status != "completed" or rc != 0:
         record.update(install="timeout" if status == "timeout" else "fail", failure_stage="install")
