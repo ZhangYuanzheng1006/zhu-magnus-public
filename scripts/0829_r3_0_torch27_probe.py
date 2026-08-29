@@ -24,10 +24,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "r3-0-torch27-probe-v2"
-VENV_DIR = Path("/tmp/r3-0/venv")
+VERSION = "r3-0-torch27-probe-v3"
+VENV_DIR = Path("/dev/shm/r3-0/venv")
+WHEEL_DIR = Path("/tmp/r3-0/wheels")
 WORK_DIR = Path("/tmp/r3-0")
-OUT_DIR = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-0-torch27-v1"))
+OUT_DIR = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-0-torch27-v3"))
 BASE_MODEL_CANDIDATES = [
     "/data/magnus/models/Qwen3.5-9B-20260828",
 ]
@@ -41,10 +42,11 @@ VLLM_DEPS = [
     "typing-inspection==0.4.2",
     "annotated-types==0.7.0",
 ]
+# v2 lesson: the full torch stack needs >20 min on the slow-write /tmp FS and
+# switching indexes busted the pip cache. v3 downloads every wheel once (phase
+# A) and installs from the local dir (phase B), with generous budgets.
 TORCH_ATTEMPTS = [
-    ("aliyun_pytorch_wheels", ["-f", "https://mirrors.aliyun.com/pytorch-wheels/cu126/"], 1200),
-    ("pypi_default", [], 1200),
-    ("pytorch_official_cu126", ["--index-url", "https://download.pytorch.org/whl/cu126"], 1200),
+    ("download_then_local_install", [], 2400, 2400),
 ]
 
 MATRIX: dict[str, Any] = {"version": VERSION, "torch": TORCH_VERSION, "vllm": VLLM_VERSION}
@@ -161,30 +163,42 @@ def torch_verify() -> tuple[bool, str]:
 
 
 def stage_torch_install() -> bool:
+    """Phase A: download all wheels to WHEEL_DIR. Phase B: install from the
+    local dir only (--no-index --find-links), so network flakiness and cache
+    key changes cannot poison the install; /dev/shm venv dodges slow writes."""
     env = dict(os.environ)
     env["PIP_CACHE_DIR"] = "/tmp/r3-0/pipcache"
-    for name, extra, timeout in TORCH_ATTEMPTS:
-        t0 = time.time()
-        marker("torch_install", "attempt", mirror=name)
-        cmd = [str(VENV_DIR / "bin" / "pip"), "install", f"torch=={TORCH_VERSION}",
-               "--timeout", "60", "--retries", "2", "--progress-bar", "off", *extra]
-        rc, out, err = stream_cmd(cmd, timeout, env=env)
-        if rc != 0:
-            record("torch_install", **{f"rc_{name}": rc, f"err_{name}": tail(err, 800),
-                                       f"seconds_{name}": round(time.time() - t0, 1)})
-            marker("torch_install", "attempt_fail", mirror=name)
-            continue
-        ok, detail = torch_verify()
-        record("torch_install", **{f"ok_{name}": ok, f"detail_{name}": detail[:1200],
-                                   f"seconds_{name}": round(time.time() - t0, 1)})
-        if ok:
-            MATRIX["torch_source"] = name
-            marker("torch_install", "done", mirror=name, detail=detail[:200])
-            return True
-        marker("torch_install", "verify_fail", mirror=name)
-    MATRIX["torch_source"] = None
-    marker("torch_install", "fail")
-    return False
+    env["PIP_NO_COMPILE"] = "1"
+    name, extra, dl_timeout, inst_timeout = TORCH_ATTEMPTS[0]
+    t0 = time.time()
+    marker("torch_download", "start")
+    dl_cmd = [str(VENV_DIR / "bin" / "pip"), "download", f"torch=={TORCH_VERSION}",
+              "-d", str(WHEEL_DIR), "--timeout", "60", "--retries", "3",
+              "--progress-bar", "off", *extra]
+    rc, out, err = stream_cmd(dl_cmd, dl_timeout, env=env)
+    record("torch_download", rc=rc, seconds=round(time.time() - t0, 1), err=tail(err, 800),
+           wheels=[p.name for p in WHEEL_DIR.glob("*.whl")][:20] if WHEEL_DIR.exists() else [])
+    marker("torch_download", "done" if rc == 0 else "fail", seconds=round(time.time() - t0, 1))
+    if rc != 0:
+        MATRIX["torch_source"] = None
+        marker("torch_install", "fail", stage="download")
+        return False
+    t1 = time.time()
+    marker("torch_install", "start", source="local_wheels")
+    inst_cmd = [str(VENV_DIR / "bin" / "pip"), "install", "--no-index",
+                "--find-links", str(WHEEL_DIR), f"torch=={TORCH_VERSION}",
+                "--progress-bar", "off"]
+    rc, out, err = stream_cmd(inst_cmd, inst_timeout, env=env)
+    if rc != 0:
+        record("torch_install", rc=rc, err=tail(err, 800), seconds=round(time.time() - t1, 1))
+        marker("torch_install", "fail", stage="install", seconds=round(time.time() - t1, 1))
+        MATRIX["torch_source"] = None
+        return False
+    ok, detail = torch_verify()
+    record("torch_install", ok=ok, detail=detail[:1200], seconds=round(time.time() - t1, 1))
+    MATRIX["torch_source"] = name
+    marker("torch_install", "done" if ok else "verify_fail", detail=detail[:200])
+    return ok
 
 
 def stage_cuda_matmul() -> bool:
@@ -331,9 +345,24 @@ def start_gpu_keepalive() -> subprocess.Popen | None:
     return p
 
 
+def pick_venv_dir() -> Path:
+    """Prefer RAM-backed /dev/shm (v2: unpacking ~3.5GB of wheels onto the
+    slow-write disk FS blew every per-attempt budget); fall back to /tmp."""
+    try:
+        free = shutil.disk_usage("/dev/shm").free
+    except Exception:  # noqa: BLE001
+        free = 0
+    if free >= 12 * 2**30:
+        return Path("/dev/shm/r3-0/venv")
+    return Path("/tmp/r3-0/venv")
+
+
 def main() -> int:
+    global VENV_DIR
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
+    VENV_DIR = pick_venv_dir()
+    MATRIX["venv_dir"] = str(VENV_DIR)
     keepalive = start_gpu_keepalive()
     try:
         stage_env()
