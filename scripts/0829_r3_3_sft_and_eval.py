@@ -28,11 +28,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-VERSION = "r3-3-sft-eval-v1"
+VERSION = "r3-3-sft-eval-v2"
 BASE_MODEL = os.environ.get("R3_MODEL", "/data/magnus/models/Qwen3.5-9B-20260828")
 DATA = os.environ.get("R3_DATA", "/data/magnus/closedloop-0828/p2/sft_trajectories.jsonl")
 QUESTIONS = "/data/magnus/closedloop-0828/p1/problems.jsonl"
-OUT = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-3-sft-eval-v1"))
+OUT = Path(os.environ.get("R3_OUT", "/data/magnus/closedloop-0828/r3-3-sft-eval-v2"))
 EXPECT_SYSTEM_SHA = "8ed1122a47ae089b1f577d61ad906cf4f7aa5f39627bfef7b6bf2afe79be3217"
 MAX_STEPS = 150
 LR = 2e-5
@@ -158,8 +158,12 @@ def render_context_prefix(tok: Any, system: str, user: str) -> str:
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         tokenize=False, add_generation_prompt=True,
         chat_template_kwargs={"enable_thinking": False})
+    # The generation prompt ends with "<think>\n" (first newline already
+    # consumed); the training template's empty think block is
+    # "<think>\n\n</think>\n\n", so exactly ONE more newline is needed before
+    # the close tag. The invariant assertion below pins this byte-exactly.
     if prompt.endswith("<think>\n"):
-        prompt += "\n\n</think>\n\n"
+        prompt += "\n</think>\n\n"
     elif prompt.endswith("<|im_start|>assistant\n"):
         prompt += "<think>\n\n</think>\n\n"
     return prompt
