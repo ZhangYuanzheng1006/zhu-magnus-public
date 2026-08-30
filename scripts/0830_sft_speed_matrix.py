@@ -72,8 +72,10 @@ def main():
     model = get_peft_model(model, LoraConfig(r=32, lora_alpha=32,
         target_modules="all-linear", lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"))
     fields = {f.name for f in __import__("dataclasses").fields(SFTConfig)}
-    kw = dict(output_dir=str(OUT / "trainer"), per_device_train_batch_size=8,
-              gradient_accumulation_steps=2, max_steps=MAX_STEPS,
+    ddp = VARIANT in {"ddp", "ddp_gas4"}
+    # DDP-2 keeps global effective batch 16 with GAS=4 (micro=2 per rank).
+    kw = dict(output_dir=str(OUT / "trainer"), per_device_train_batch_size=(2 if ddp else 8),
+              gradient_accumulation_steps=(4 if ddp else 2), max_steps=MAX_STEPS,
               learning_rate=2e-5, weight_decay=0.0, max_grad_norm=1.0,
               bf16=True, gradient_checkpointing=(VARIANT != "no_ckpt"),
               logging_steps=10, save_strategy="no", max_length=MAX_LEN,
