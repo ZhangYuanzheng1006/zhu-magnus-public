@@ -141,7 +141,9 @@ def main() -> int:
 
     policy = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16,
                                                   device_map={"": 0})
-    policy = PeftModel.from_pretrained(policy, CKPT)
+    # is_trainable=False is the default and freezes every adapter param —
+    # continuing training from a checkpoint requires the explicit flag
+    policy = PeftModel.from_pretrained(policy, CKPT, is_trainable=True)
     trainable = [n for n, p in policy.named_parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     ref = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.bfloat16,
