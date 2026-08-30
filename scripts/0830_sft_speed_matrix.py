@@ -20,7 +20,7 @@ MODEL = os.environ.get("SPEED_MODEL", "/data/magnus/models/Qwen3.5-9B-20260828")
 DATA = os.environ.get("SPEED_DATA", "/data/magnus/closedloop-0828/p2/sft_trajectories.jsonl")
 OUT = Path(os.environ.get("SPEED_OUT", f"/data/magnus/closedloop-0828/sft-speed/{VARIANT}"))
 MAX_LEN = 4096
-MAX_STEPS = 150
+MAX_STEPS = int(os.environ.get("SPEED_STEPS", "150"))
 
 
 def rows500():
@@ -61,10 +61,17 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     rows = rows500()
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=False)
+    ddp = VARIANT in {"ddp", "ddp_gas4", "ddp_gas4_v2"}
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if ddp:
+        torch.cuda.set_device(local_rank)
+        load_device = {"": f"cuda:{local_rank}"}
+    else:
+        load_device = "cuda"
     model = AutoModelForCausalLM.from_pretrained(
         MODEL, dtype=torch.bfloat16, low_cpu_mem_usage=True,
         use_safetensors=True, trust_remote_code=False,
-        attn_implementation="sdpa")
+        attn_implementation="sdpa", device_map=load_device)
     model.config.use_cache = False
     for n, p in model.named_parameters():
         if any(x in n.lower() for x in ("vision", "visual", "image_processor", "merger")):
@@ -72,7 +79,6 @@ def main():
     model = get_peft_model(model, LoraConfig(r=32, lora_alpha=32,
         target_modules="all-linear", lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"))
     fields = {f.name for f in __import__("dataclasses").fields(SFTConfig)}
-    ddp = VARIANT in {"ddp", "ddp_gas4", "ddp_gas4_v2"}
     # DDP-2 keeps global effective batch 16 with GAS=4 (micro=2 per rank).
     kw = dict(output_dir=str(OUT / "trainer"), per_device_train_batch_size=(2 if ddp else 8),
               gradient_accumulation_steps=(4 if ddp else 2), max_steps=MAX_STEPS,
