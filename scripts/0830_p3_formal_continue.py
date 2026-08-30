@@ -37,7 +37,7 @@ REPLAY_DATA = os.environ.get("P3_REPLAY", "/data/magnus/closedloop-0828/r4-3-f6-
 PROBE_DATA = os.environ.get("P3_PROBE", "/data/magnus/closedloop-0828/r4-3-f6-freeze-v1/forget-probe-heldout-50.jsonl")
 PROBLEMS = "/data/magnus/closedloop-0828/p1/problems.jsonl"
 OUT = Path(os.environ.get("P3_OUT", "/data/magnus/closedloop-0828/p3-formal-continue-v2"))
-RESUME = os.environ.get("P3_RESUME", "/data/magnus/closedloop-0828/p3-formal-v1/trainer/checkpoint-1500")
+RESUME = os.environ.get("P3_RESUME", "/data/magnus/closedloop-0828/p3-formal-v1/trainer/checkpoint-1000")
 SYSTEM_SHA = "8ed1122a47ae089b1f577d61ad906cf4f7aa5f39627bfef7b6bf2afe79be3217"
 MICRO = int(os.environ.get("P3_MICRO", "8"))
 ACCUM = int(os.environ.get("P3_ACCUM", "2"))
@@ -253,7 +253,75 @@ class KillSwitch(Exception):
     pass
 
 
+def _run_stream(cmd, timeout, env=None):
+    import subprocess, threading, time
+    t0 = time.time()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env)
+    def pump(src, tag):
+        for line in src:
+            print(f"{tag}| {line.strip()[:150]}", flush=True)
+    threading.Thread(target=pump, args=(proc.stdout, "pip"), daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stderr, "piperr"), daemon=True).start()
+    stop = threading.Event()
+    def beat():
+        while not stop.wait(45):
+            print(f"[heartbeat] alive_s={int(time.time()-t0)}", flush=True)
+    threading.Thread(target=beat, daemon=True).start()
+    rc = proc.wait(timeout=timeout)
+    stop.set()
+    return rc
+
+
+def ensure_torch27_venv() -> str | None:
+    """TRL GRPOTrainer needs FSDPModule (torch>=2.6); image torch is 2.5.1.
+    Bootstrap a /dev/shm venv with torch 2.7.1 cu126 (validated by R3-0 v3/v4:
+    download ~494s via mirror, local install ~72s) and re-exec under it."""
+    try:
+        from torch.distributed.fsdp import FSDPModule  # noqa: F401
+        return None
+    except Exception:
+        pass
+    import shutil
+    import subprocess
+    venv = Path("/dev/shm/r4-1c/venv")
+    py = venv / "bin" / "python"
+    marker("bootstrap", "start", reason="FSDPModule missing in torch 2.5.1; v3 adds torchvision 0.22.1 ABI match")
+    try:
+        free = shutil.disk_usage("/dev/shm").free
+    except Exception:
+        free = 0
+    if free < 12 * 2**30:
+        venv = Path("/tmp/r4-1c/venv")
+        py = venv / "bin" / "python"
+    env = dict(os.environ)
+    env["PIP_NO_COMPILE"] = "1"
+    if not py.exists():
+        subprocess.run(["python3", "-m", "venv", "--system-site-packages", str(venv)],
+                       check=True, timeout=300)
+        wheels = Path("/tmp/r4-1c/wheels")
+        wheels.mkdir(parents=True, exist_ok=True)
+        rc = _run_stream([str(venv / "bin" / "pip"), "download", "torch==2.7.1",
+                          "torchvision==0.22.1", "torchaudio==2.7.1",
+                          "-d", str(wheels), "--timeout", "60", "--retries", "3",
+                          "--progress-bar", "off"], 2400, env)
+        if rc != 0:
+            raise RuntimeError("torch wheel download failed")
+        rc = _run_stream([str(venv / "bin" / "pip"), "install", "--no-index",
+                          "--find-links", str(wheels), "torch==2.7.1",
+                          "torchvision==0.22.1", "torchaudio==2.7.1", "--progress-bar", "off"], 1200, env)
+        if rc != 0:
+            raise RuntimeError("torch local install failed")
+    marker("bootstrap", "done", venv=str(venv))
+    return str(py)
+
+
+
 def main() -> int:
+    py27 = ensure_torch27_venv()
+    if py27:
+        marker("reexec", "start", py=py27)
+        os.execv(py27, [py27, __file__])
     import torch
     from datasets import Dataset, concatenate_datasets
     from peft import LoraConfig, get_peft_model
@@ -462,20 +530,21 @@ def main() -> int:
     trainer.add_callback(GateCallback())
 
     t1 = time.time()
-    marker("train", "start", resume_from=RESUME if Path(RESUME).exists() else "none")
+    if not Path(RESUME).exists():
+        # NEVER silently fresh-run a continuation (R4 lesson: v2c burned a GPU
+        # for 15 min because of this fallback)
+        raise RuntimeError(f"resume checkpoint missing: {RESUME}")
+    marker("train", "start", resume_from=RESUME)
     status = "completed"
     try:
-        if Path(RESUME).exists():
-            trainer.train(resume_from_checkpoint=RESUME)
-        else:
-            trainer.train()
+        trainer.train(resume_from_checkpoint=RESUME)
     except KillSwitch as ks:
         status = f"kill-switch {ks}"
         marker("train", "KILLED", reason=str(ks))
     except Exception as exc:  # noqa: BLE001
         status = f"error: {type(exc).__name__}: {exc}"
         RECEIPT["train_traceback_tail"] = traceback.format_exc()[-2000:]
-        marker("train", "ERROR", err=str(exc)[:200])
+        marker("train_error", "hit", err=str(exc)[:200])
     RECEIPT["train_status"] = status
     RECEIPT["train_seconds"] = round(time.time() - t1, 1)
     RECEIPT["log_history_tail"] = trainer.state.log_history[-10:]
