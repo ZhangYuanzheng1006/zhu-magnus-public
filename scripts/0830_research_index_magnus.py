@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sqlite3
 import tarfile
 import time
 from pathlib import Path
@@ -58,14 +59,22 @@ def main() -> int:
         "python3", str(INDEX_SCRIPT), "--db", str(db), "index",
         "--embed-limit", "0", "--embed-batch", os.environ.get("INDEX_EMBED_BATCH", "16")
     ], check=False)
-    receipt = {"status": "success" if proc.returncode == 0 else "failed",
-               "returncode": proc.returncode, "seconds": round(time.time() - started, 1),
+    chunks = embedded = 0
+    if db.exists():
+        con = sqlite3.connect(db)
+        chunks, embedded = con.execute("SELECT COUNT(*), SUM(embedding IS NOT NULL) FROM chunks").fetchone()
+        con.close()
+    status = "success" if proc.returncode == 0 and embedded > 0 else "failed"
+    receipt = {"status": status,
+               "returncode": proc.returncode if proc.returncode else (0 if embedded > 0 else 3),
+               "seconds": round(time.time() - started, 1),
                "db": str(db), "source": str(SOURCE),
+               "chunks": chunks, "embedded": embedded,
                "archive_sha256": hashlib.sha256(ARCHIVE.read_bytes()).hexdigest()}
     (OUT / "receipt.json").write_text(json.dumps(receipt, ensure_ascii=False, indent=2), encoding="utf-8")
     marker("index", receipt["status"], seconds=receipt["seconds"], db=db)
     print("**IDX_SUMMARY** " + json.dumps(receipt, ensure_ascii=False), flush=True)
-    return proc.returncode
+    return int(receipt["returncode"])
 
 
 if __name__ == "__main__":
